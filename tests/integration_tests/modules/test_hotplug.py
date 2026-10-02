@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 import time
 from collections import namedtuple
@@ -443,7 +444,9 @@ WantedBy=cloud-final.service
 """  # noqa: E501
 
 
-def _customize_environment(client: IntegrationInstance):
+def _customize_environment(
+    client: IntegrationInstance, *, new_instance: bool = False
+):
     push_and_enable_systemd_unit(
         client, "block-cloud-config.service", BLOCK_CLOUD_CONFIG
     )
@@ -468,6 +471,14 @@ def _customize_environment(client: IntegrationInstance):
     )
     client.write_to_file("/etc/pam.d/sshd", contents)
 
+    if new_instance:
+        # Re-run first-boot modules without inheriting installed udev rules.
+        # Cleaning only cloud-init's state would mask the first-boot race.
+        assert client.execute("cloud-init clean --logs").ok
+        assert client.execute(
+            "rm -f /etc/udev/rules.d/90-cloud-init-hook-hotplug.rules"
+        ).ok
+
     client.instance.shutdown(wait=True)
     client.instance.start(wait=False)
 
@@ -478,15 +489,17 @@ def _customize_environment(client: IntegrationInstance):
     " ability to add_network_interface",
 )
 @pytest.mark.user_data(USER_DATA)
-def test_nics_before_config_trigger_hotplug(client: IntegrationInstance):
+@pytest.mark.parametrize("new_instance", [False, True])
+def test_nics_before_config_trigger_hotplug(
+    client: IntegrationInstance, new_instance: bool
+):
     """
     Test that NICs added after the Network boot stage but before
     the rest boot stages do trigger cloud-init-hotplugd.
 
-    Note: Do not test first boot, as cc_install_hotplug runs at
-    config-final.service time.
+    Cover both a subsequent boot and a clean first boot without existing rules.
     """
-    _customize_environment(client)
+    _customize_environment(client, new_instance=new_instance)
 
     # wait until we are between cloud-config.target done and
     # cloud-config.service
@@ -500,6 +513,10 @@ def test_nics_before_config_trigger_hotplug(client: IntegrationInstance):
     assert_systemctl_status_code(client, "cloud-config.service", 3)
     assert_systemctl_status_code(client, "cloud-final.service", 3)
 
+    assert client.execute(
+        "test -f /etc/udev/rules.d/90-cloud-init-hook-hotplug.rules"
+    ).ok
+    ips_before = _get_ip_addr(client)
     client.instance.add_network_interface()
 
     assert_systemctl_status_code(client, "cloud-config.service", 3)
@@ -519,3 +536,12 @@ def test_nics_before_config_trigger_hotplug(client: IntegrationInstance):
 
     wait_for_cloud_init(client)
     _wait_till_hotplug_complete(client, expected_runs=1)
+    ips_after = _get_ip_addr(client)
+    added = [
+        ip
+        for ip in ips_after
+        if ip.interface not in {existing.interface for existing in ips_before}
+    ]
+    assert len(added) == 1
+    assert added[0].state == "UP"
+    assert ipaddress.ip_address(added[0].ip4).version == 4

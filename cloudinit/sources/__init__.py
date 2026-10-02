@@ -1226,7 +1226,9 @@ def pkl_store(obj: DataSource, fname: str) -> bool:
         util.logexc(LOG, "Failed pickling datasource %s", obj)
         return False
     try:
-        util.write_file(fname, pk_contents, omode="wb", mode=0o400)
+        # Hotplug may update the cache while another process is restoring it.
+        # Readers must see either the previous pickle or its full replacement.
+        atomic_helper.write_file(fname, pk_contents, omode="wb", mode=0o400)
     except Exception:
         util.logexc(LOG, "Failed pickling datasource to %s", fname)
         return False

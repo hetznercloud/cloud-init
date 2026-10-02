@@ -107,6 +107,9 @@ disable_vmware_customization: false
 
 # The modules that run in the 'init' stage
 cloud_init_modules:
+{% if not is_bsd %}
+  - install_hotplug
+{% endif %}
 {% if variant not in ["netbsd"] %}
   - seed_random
 {% endif %}
@@ -118,7 +121,6 @@ cloud_init_modules:
 {% endif %}
 {% if not is_bsd %}
   - disk_setup
-  - install_hotplug
   - mounts
 {% endif %}
   - set_hostname
