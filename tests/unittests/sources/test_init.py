@@ -5,11 +5,12 @@ import copy
 import inspect
 import logging
 import os
+import pickle
 import stat
 
 import pytest
 
-from cloudinit import importer, util
+from cloudinit import atomic_helper, importer, util
 from cloudinit.distros import ubuntu
 from cloudinit.event import EventScope, EventType
 from cloudinit.helpers import Paths
@@ -21,6 +22,7 @@ from cloudinit.sources import (
     DataSource,
     canonical_cloud_id,
     pkl_load,
+    pkl_store,
     redact_sensitive_keys,
 )
 from cloudinit.user_data import UserDataProcessor
@@ -93,6 +95,74 @@ class TestDataSource:
         assert self.datasource.vendordata_raw is None
         assert {"key1": False} == self.datasource.ds_cfg
         assert isinstance(self.datasource.ud_proc, UserDataProcessor)
+
+    def test_pkl_store_replaces_cache_atomically(self, datasource, tmp_path):
+        """An existing reader retains a complete cache during replacement."""
+        cache = tmp_path / "obj.pkl"
+        datasource.metadata = {"instance-id": "before-hotplug"}
+        assert pkl_store(datasource, str(cache))
+        # Allow non-root tests to reproduce the old in-place write behavior.
+        cache.chmod(0o600)
+
+        with cache.open("rb") as reader:
+            datasource.metadata = {"instance-id": "after-hotplug"}
+            with mock.patch(
+                "cloudinit.sources.atomic_helper.write_file",
+                wraps=atomic_helper.write_file,
+            ) as m_write:
+                assert pkl_store(datasource, str(cache))
+            assert pickle.load(reader).metadata == {
+                "instance-id": "before-hotplug"
+            }
+            assert m_write.call_count == 1
+            assert m_write.call_args.kwargs == {"omode": "wb", "mode": 0o400}
+
+        assert pkl_load(str(cache)).metadata == {
+            "instance-id": "after-hotplug"
+        }
+        assert stat.S_IMODE(cache.stat().st_mode) == 0o400
+
+    def test_pkl_store_failed_replace_preserves_cache(
+        self, datasource, tmp_path
+    ):
+        """A failed atomic replacement leaves a readable previous cache."""
+        cache = tmp_path / "cache" / "obj.pkl"
+        datasource.metadata = {"instance-id": "before-hotplug"}
+        assert pkl_store(datasource, str(cache))
+        cache.chmod(0o600)
+        previous = cache.read_bytes()
+        datasource.metadata = {"instance-id": "after-hotplug"}
+
+        with mock.patch(
+            "cloudinit.atomic_helper.os.rename", side_effect=OSError("failed")
+        ):
+            assert not pkl_store(datasource, str(cache))
+
+        assert cache.read_bytes() == previous
+        assert pkl_load(str(cache)).metadata == {
+            "instance-id": "before-hotplug"
+        }
+        assert list(cache.parent.iterdir()) == [cache]
+
+    def test_pkl_store_creates_private_cache(self, datasource, tmp_path):
+        """First writes create missing directories and use mode 0400."""
+        cache = tmp_path / "new-instance" / "obj.pkl"
+        assert pkl_store(datasource, str(cache))
+        assert pkl_load(str(cache)).metadata == datasource.metadata
+        assert stat.S_IMODE(cache.stat().st_mode) == 0o400
+
+    def test_pkl_store_serialization_failure_preserves_cache(
+        self, datasource, tmp_path
+    ):
+        """Serialization errors must not change a previously valid cache."""
+        cache = tmp_path / "obj.pkl"
+        assert pkl_store(datasource, str(cache))
+        previous = cache.read_bytes()
+        with mock.patch(
+            "cloudinit.sources.pickle.dumps", side_effect=TypeError("failed")
+        ):
+            assert not pkl_store(datasource, str(cache))
+        assert cache.read_bytes() == previous
 
     def test_datasource_init_gets_ds_cfg_using_dsname(self, paths):
         """Init uses DataSource.dsname for sourcing ds_cfg."""

@@ -45,6 +45,32 @@ class TestRenderCloudCfg:
             system_cfg = util.load_yaml(stream.read())
         assert system_cfg["system_info"]["distro"] == "ubuntu"
 
+    @pytest.mark.parametrize("variant", DISTRO_VARIANTS)
+    def test_hotplug_installed_before_other_init_modules(
+        self, variant, tmpdir
+    ):
+        """Install hotplug first, after the datasource has been cached."""
+        outfile = tmpdir.join("outcfg").strpath
+        templater.render_template(
+            variant, self.tmpl_path, outfile, is_yaml=True
+        )
+        with open(outfile) as stream:
+            system_cfg = util.load_yaml(stream.read())
+        modules = [
+            module
+            for stage in (
+                "cloud_init_modules",
+                "cloud_config_modules",
+                "cloud_final_modules",
+            )
+            for module in system_cfg[stage]
+        ]
+        if variant in ("freebsd", "netbsd", "openbsd"):
+            assert "install_hotplug" not in modules
+        else:
+            assert system_cfg["cloud_init_modules"][0] == "install_hotplug"
+            assert modules.count("install_hotplug") == 1
+
     def test_variant_sets_prefix_in_cloud_cfg_subp(self, tmpdir):
         outfile = tmpdir.join("outcfg").strpath
 
